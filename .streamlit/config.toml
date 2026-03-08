@@ -1,0 +1,17 @@
+# Journal Quality app — Streamlit config
+# https://docs.streamlit.io/library/advanced-configuration
+
+[theme]
+primaryColor = "#1a5f4a"
+backgroundColor = "#fafafa"
+secondaryBackgroundColor = "#f0f2f6"
+textColor = "#262730"
+font = "sans serif"
+
+[server]
+headless = true
+enableCORS = false
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false

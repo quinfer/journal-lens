@@ -1,0 +1,525 @@
+"""
+Journal Lookup GUI + Literature Search
+
+- Browse and filter the AJG 2024 master by Field, grade, JCR quartile, etc.
+- Search by journal name.
+- Literature search: find recent works in selected/filtered journals via OpenAlex (no API key).
+- Sanity check: validate references (e.g. from GenAI) against OpenAlex + AJG master.
+
+Run: streamlit run journal_lookup_app.py
+"""
+
+import re
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import pandas as pd
+import streamlit as st
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+DATA_DIR = Path(__file__).resolve().parent
+MASTER_CSV = DATA_DIR / "ajg_2024_master_with_jcr.csv"
+
+# -----------------------------------------------------------------------------
+# Load data
+# -----------------------------------------------------------------------------
+@st.cache_data
+def load_master():
+    if not MASTER_CSV.exists():
+        return None
+    df = pd.read_csv(MASTER_CSV)
+    # Coerce numeric-ish columns for display
+    for c in ["Citescore rank", "SNIP rank", "SJR rank", "JIF rank", "JCR_2021_JIF", "JCR_2023_JIF"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def format_issn(issn: str) -> str:
+    """Turn 8-char ISSN (digits or 7 digits + X) into XXXX-XXXX format for display/API."""
+    if not issn or not isinstance(issn, str):
+        return ""
+    s = str(issn).strip().upper().replace("-", "")
+    # Allow digits and trailing X (valid ISSN check digit)
+    s = "".join(c for c in s if c in "0123456789X")
+    if len(s) == 8:
+        return f"{s[:4]}-{s[4:]}"
+    return s
+
+
+# -----------------------------------------------------------------------------
+# OpenAlex literature search (no API key required)
+# -----------------------------------------------------------------------------
+def openalex_works_for_issn(
+    issn: str,
+    per_page: int = 25,
+    from_year: int | None = None,
+    to_year: int | None = None,
+    search_query: str | None = None,
+    open_access_only: bool = False,
+    sort_by: str = "publication_date:desc",
+) -> list[dict]:
+    """Fetch works from OpenAlex for a journal by ISSN, with optional search and filters."""
+    import urllib.parse
+    import urllib.request
+
+    issn_fmt = format_issn(issn)
+    if not issn_fmt or len(issn_fmt) < 8:
+        return []
+
+    filters = [f"primary_location.source.issn:{issn_fmt}"]
+    if from_year is not None:
+        filters.append(f"from_publication_date:{from_year}-01-01")
+    if to_year is not None:
+        filters.append(f"to_publication_date:{to_year}-12-31")
+    if open_access_only:
+        filters.append("is_oa:true")
+
+    params = {
+        "filter": ",".join(filters),
+        "per-page": min(per_page, 200),
+        "sort": sort_by,
+    }
+    if search_query and search_query.strip():
+        params["search"] = search_query.strip()
+    url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "JournalLookupApp/1.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = resp.read().decode()
+    except Exception:
+        return []
+    try:
+        import json
+        out = json.loads(data)
+        return out.get("results") or []
+    except Exception:
+        return []
+
+
+def works_to_display(works: list[dict], include_journal: bool = False) -> list[dict]:
+    """Convert OpenAlex work objects to simple rows for display."""
+    rows = []
+    for w in works:
+        title = w.get("display_name") or w.get("title") or ""
+        year = (w.get("publication_date") or "")[:4] or ""
+        authors = w.get("authorships") or []
+        author_names = ", ".join(
+            (a.get("author", {}).get("display_name") or "") for a in authors[:5]
+        )
+        if len(authors) > 5:
+            author_names += " et al."
+        ids = w.get("ids") or {}
+        doi = (ids.get("doi") or "").replace("https://doi.org/", "")
+        oa = w.get("open_access") or {}
+        is_oa = oa.get("is_oa", False)
+        url = w.get("id") or (f"https://doi.org/{doi}" if doi else "")
+        if isinstance(url, str) and url.startswith("https://doi.org/"):
+            pass
+        elif isinstance(url, str) and not url.startswith("http"):
+            url = f"https://doi.org/{url}" if url else ""
+        cited = w.get("cited_by_count") or 0
+        row = {
+            "Title": title,
+            "Year": year,
+            "Authors": author_names,
+            "Cited by": cited,
+            "DOI": doi,
+            "Open access": "Yes" if is_oa else "No",
+            "URL": url,
+        }
+        if include_journal:
+            row["Journal"] = w.get("_journal", "")
+        rows.append(row)
+    return rows
+
+
+# -----------------------------------------------------------------------------
+# OpenAlex lookup by DOI or search (for reference validation)
+# -----------------------------------------------------------------------------
+DOI_PATTERN = re.compile(
+    r"(?:https?://(?:dx\.)?doi\.org/|DOI:?\s*)(10\.\d{4,}/[^\s\]>\)]+)",
+    re.IGNORECASE,
+)
+
+
+def extract_doi(line: str) -> str | None:
+    """Extract first DOI from a line of text."""
+    m = DOI_PATTERN.search(line)
+    if m:
+        return m.group(1).rstrip(".,;:)")
+    return None
+
+
+def openalex_work_by_doi(doi: str) -> dict | None:
+    """Fetch a single work from OpenAlex by DOI. Returns work dict or None."""
+    doi = doi.strip().rstrip(".,;:)")
+    if not doi.startswith("http"):
+        doi = f"https://doi.org/{doi}"
+    params = {"filter": f"doi:{doi}", "per-page": 1}
+    url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "JournalLookupApp/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = resp.read().decode()
+    except Exception:
+        return None
+    try:
+        import json
+        out = json.loads(data)
+        results = out.get("results") or []
+        return results[0] if results else None
+    except Exception:
+        return None
+
+
+def openalex_work_by_search(query: str, per_page: int = 3) -> list[dict]:
+    """Search OpenAlex works by title/abstract; return list of results."""
+    if not query or len(query.strip()) < 3:
+        return []
+    params = {"search": query.strip()[:200], "per-page": per_page, "sort": "relevance_score:desc"}
+    url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "JournalLookupApp/1.0"})
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            data = resp.read().decode()
+    except Exception:
+        return []
+    try:
+        import json
+        out = json.loads(data)
+        return out.get("results") or []
+    except Exception:
+        return []
+
+
+def get_journal_from_work(w: dict) -> tuple[str, str]:
+    """From OpenAlex work get (journal display name, ISSN)."""
+    loc = w.get("primary_location") or {}
+    src = loc.get("source") or {}
+    name = src.get("display_name") or ""
+    issn = (src.get("issn") or "").strip()
+    if not issn and isinstance(src.get("issn_l"), str):
+        issn = src.get("issn_l", "")
+    return name, issn
+
+
+def normalize_title_for_match(s: str) -> str:
+    """Lowercase, collapse spaces, remove punctuation for fuzzy match."""
+    if not s:
+        return ""
+    s = re.sub(r"[^\w\s]", " ", str(s).lower())
+    return " ".join(s.split())
+
+
+def parse_bibtex_string(bib_content: str) -> list[dict]:
+    """Parse .bib content into list of dicts with keys doi, title, journal, year, snippet. No external deps."""
+    entries = []
+    # Split by @entry type; keep blocks that look like @article{ ... }, @inbook{ ... }, etc.
+    blocks = re.split(r"@\w+\s*\{", bib_content, flags=re.IGNORECASE)
+    for block in blocks[1:]:  # first split is before any @
+        # First comma up to next } is often the cite key; then fields
+        field_part = block
+        # Extract key = value or key = {value} or key = "value"
+        def get_field(name: str) -> str:
+            # Match name = { ... } (non-greedy, allow nested braces roughly) or name = "..."
+            pat = re.compile(
+                rf"{re.escape(name)}\s*=\s*[\{{]\s*([^{{}}]+)[\}}]|{re.escape(name)}\s*=\s*[\"]([^\"]+)[\"]",
+                re.IGNORECASE | re.DOTALL,
+            )
+            m = pat.search(field_part)
+            if m:
+                return (m.group(1) or m.group(2) or "").strip().replace("\n", " ")
+            return ""
+        doi = get_field("doi") or get_field("DOI")
+        if not doi and "doi.org" in field_part:
+            m = re.search(r"doi\.org/(10\.\d{4,}/[^\s\}\"]+)", field_part)
+            if m:
+                doi = m.group(1).rstrip(".,;:)")
+        title = get_field("title") or get_field("Title")
+        journal = get_field("journal") or get_field("Journal") or get_field("journaltitle")
+        year = get_field("year") or get_field("Year")
+        snippet = (title or journal or doi or field_part[:60]).strip()[:80]
+        entries.append({"doi": doi or None, "title": title, "journal": journal, "year": year, "snippet": snippet})
+    return entries
+
+
+def find_journal_in_master(master_df: pd.DataFrame, journal_name: str, issn: str) -> pd.Series | None:
+    """Return first master row matching journal by name or ISSN, else None."""
+    if not journal_name and not issn:
+        return None
+    issn_clean = re.sub(r"\D", "", str(issn)) if issn else ""
+    if issn_clean and len(issn_clean) >= 7:
+        master_issn = master_df["ISSN"].astype(str).str.replace(r"\D", "", regex=True)
+        match = master_df[master_issn == issn_clean]
+        if not match.empty:
+            return match.iloc[0]
+    name_norm = normalize_title_for_match(journal_name)
+    if not name_norm:
+        return None
+    for _, row in master_df.iterrows():
+        t = (row.get("Journal Title") or "")
+        if name_norm in normalize_title_for_match(t) or normalize_title_for_match(t) in name_norm:
+            return row
+    return None
+
+
+# -----------------------------------------------------------------------------
+# UI
+# -----------------------------------------------------------------------------
+def main():
+    st.set_page_config(
+        page_title="Journal Lookup & Literature",
+        page_icon="📚",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    # Light polish: reduce top padding, subtle divider
+    st.markdown(
+        """
+        <style>
+        .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+        footer { visibility: hidden; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.title("Journal Lookup & Literature")
+    st.caption(
+        "Browse AJG 2024 by field and grade • Search recent literature via OpenAlex • Validate references (e.g. from GenAI) against OpenAlex and the AJG master."
+    )
+
+    df = load_master()
+    if df is None:
+        st.error(f"Master CSV not found: {MASTER_CSV}")
+        return
+
+    # ---- Sidebar filters ----
+    st.sidebar.header("Filters")
+    field_vals = sorted(df["Field"].dropna().astype(str).unique().tolist())
+    field_filter = st.sidebar.multiselect("Field (AJG)", field_vals, default=[])
+    ajg24_vals = sorted(df["AJG 2024"].dropna().astype(str).unique().tolist(), key=lambda x: (x.replace("*", ""), x))
+    ajg24_filter = st.sidebar.multiselect("AJG 2024", ajg24_vals, default=[])
+    ajg21_filter = st.sidebar.multiselect("AJG 2021", sorted(df["AJG 2021"].dropna().astype(str).unique().tolist(), key=lambda x: (x.replace("*", ""), x)), default=[])
+    q_vals = ["Q1", "Q2", "Q3", "Q4"]
+    q2021 = st.sidebar.multiselect("JCR 2021 quartile", q_vals, default=[])
+    q2023 = st.sidebar.multiselect("JCR 2023 quartile", q_vals, default=[])
+    title_search = st.sidebar.text_input("Search journal name", placeholder="e.g. Accounting Review")
+
+    # Apply filters
+    subset = df.copy()
+    if field_filter:
+        subset = subset[subset["Field"].astype(str).isin(field_filter)]
+    if ajg24_filter:
+        subset = subset[subset["AJG 2024"].astype(str).isin(ajg24_filter)]
+    if ajg21_filter:
+        subset = subset[subset["AJG 2021"].astype(str).isin(ajg21_filter)]
+    if q2021:
+        subset = subset[subset["JCR_2021_JIF_Quartile"].astype(str).isin(q2021)]
+    if q2023:
+        subset = subset[subset["JCR_2023_JIF_Quartile"].astype(str).isin(q2023)]
+    if title_search:
+        subset = subset[
+            subset["Journal Title"].astype(str).str.lower().str.contains(title_search.lower(), na=False)
+        ]
+
+    st.sidebar.metric("Journals matching filters", len(subset))
+
+    # ---- Main: data table ----
+    st.header("Journals")
+    display_cols = [
+        "Field", "Journal Title", "AJG 2024", "AJG 2021",
+        "JCR_2021_JIF_Quartile", "JCR_2023_JIF_Quartile",
+        "JCR_2021_JIF", "JCR_2023_JIF", "ISSN", "Publisher",
+    ]
+    display_cols = [c for c in display_cols if c in subset.columns]
+    st.dataframe(
+        subset[display_cols].head(500),
+        use_container_width=True,
+        hide_index=True,
+    )
+    if len(subset) > 500:
+        st.caption(f"Showing first 500 of {len(subset)}. Narrow filters to see fewer.")
+
+    # ---- Literature search tab ----
+    st.divider()
+    st.subheader("Literature search (OpenAlex)")
+    st.caption("Fetch articles for selected journals (by ISSN). Optional: text search, open access only, date range, sort by newest or most cited. See docs/OPENALEX_SEARCH.md for full filter reference.")
+
+    # Journals with ISSN for literature search (ISSN can be 8 digits or 7 digits + X)
+    def valid_issn(s):
+        if pd.isna(s) or not str(s).strip():
+            return False
+        s = str(s).strip().upper().replace("-", "")
+        if len(s) == 8 and (s[-1] in "X0123456789" and s[:-1].isdigit()):
+            return True
+        if len(s) == 8 and s.isdigit():
+            return True
+        return False
+    with_issn = subset[subset["ISSN"].apply(valid_issn)]
+    if with_issn.empty:
+        st.info("No journals with ISSN in the current selection. Remove some filters or pick a different set.")
+    else:
+        lit_journals = st.multiselect(
+            "Journals to search (select one or more)",
+            options=with_issn["Journal Title"].astype(str).tolist(),
+            default=with_issn["Journal Title"].astype(str).iloc[:1].tolist() if len(with_issn) else [],
+            max_selections=5,
+        )
+        from_year = st.number_input("From publication year", min_value=1990, max_value=2030, value=2020, step=1)
+        to_year = st.number_input("To publication year (optional)", min_value=1990, max_value=2030, value=2030, step=1, help="Leave at 2030 for 'up to now'")
+        search_query = st.text_input("Search in title/abstract (optional)", placeholder="e.g. corporate governance")
+        open_access_only = st.checkbox("Open access only", value=False)
+        sort_by = st.selectbox(
+            "Sort by",
+            options=["publication_date:desc", "cited_by_count:desc"],
+            format_func=lambda x: "Newest first" if x == "publication_date:desc" else "Most cited first",
+            index=0,
+        )
+        per_journal = st.slider("Max works per journal", 5, 50, 15)
+        if st.button("Search literature"):
+            all_works = []
+            issn_to_title = with_issn.set_index("Journal Title")["ISSN"].to_dict()
+            for title in lit_journals:
+                issn = issn_to_title.get(title, "")
+                if not str(issn).strip():
+                    continue
+                with st.spinner(f"Fetching works for {title[:50]}..."):
+                    works = openalex_works_for_issn(
+                        str(issn),
+                        per_page=per_journal,
+                        from_year=from_year,
+                        to_year=to_year if to_year != 2030 else None,
+                        search_query=search_query.strip() or None,
+                        open_access_only=open_access_only,
+                        sort_by=sort_by,
+                    )
+                for w in works:
+                    w["_journal"] = title
+                all_works.extend(works)
+            if not all_works:
+                st.warning("No works returned. Try different journals or a later from-year.")
+            else:
+                rows = works_to_display(all_works, include_journal=len(lit_journals) > 1)
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "URL": st.column_config.LinkColumn("URL", display_text="Link"),
+                    },
+                )
+                st.success(f"Found {len(rows)} works.")
+
+    # ---- Sanity check references (GenAI) ----
+    st.divider()
+    st.subheader("Sanity check references (GenAI)")
+    st.caption("Paste references or upload a file. Each entry is validated against OpenAlex (ground truth); we report Found / Not found, journal in AJG master, and any mismatches (e.g. BibTeX vs OpenAlex).")
+    refs_file = st.file_uploader("Upload .txt or .bib (optional)", type=["txt", "bib"], help="TXT: one reference per line. BIB: BibTeX entries; DOIs and titles are used for lookup.")
+    refs_text = st.text_area(
+        "Or paste references here (one per line). Ignored if a file is uploaded.",
+        height=100,
+        placeholder="e.g.\nSmith, J. (2023). Title. Journal of Finance. https://doi.org/10.1234/xyz\nOr one DOI per line: 10.1234/xyz",
+    )
+    if st.button("Validate against OpenAlex"):
+        refs_raw: list[str | dict] = []
+        if refs_file is not None:
+            try:
+                raw = refs_file.read().decode("utf-8", errors="replace")
+            except Exception:
+                raw = ""
+            if refs_file.name.lower().endswith(".bib"):
+                parsed = parse_bibtex_string(raw)
+                refs_raw = parsed if parsed else [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
+            else:
+                refs_raw = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
+        else:
+            refs_raw = [ln.strip() for ln in (refs_text or "").strip().splitlines() if ln.strip()]
+        if not refs_raw:
+            st.warning("Paste at least one reference line or upload a .txt / .bib file.")
+        else:
+            master_df = load_master()
+            results = []
+            for i, ref in enumerate(refs_raw):
+                is_bib = isinstance(ref, dict)
+                if is_bib:
+                    doi = (ref.get("doi") or "").strip() or None
+                    title = (ref.get("title") or "").strip()
+                    journal_bib = (ref.get("journal") or "").strip()
+                    year_bib = (ref.get("year") or "").strip()
+                    snippet = (ref.get("snippet") or title or journal_bib or "")[:80]
+                else:
+                    line = str(ref)
+                    doi = extract_doi(line)
+                    title = journal_bib = year_bib = ""
+                    snippet = line[:80] + ("…" if len(line) > 80 else "")
+                with st.spinner(f"Checking reference {i + 1}/{len(refs_raw)}..."):
+                    work = openalex_work_by_doi(doi) if doi else None
+                    if work is None and (title or snippet):
+                        search_snippet = (title or (snippet if is_bib else re.sub(DOI_PATTERN, "", str(ref)).strip()))[:120]
+                        if len(search_snippet) >= 4:
+                            works = openalex_work_by_search(search_snippet, per_page=1)
+                            work = works[0] if works else None
+                    if work is None:
+                        results.append({
+                            "Reference (snippet)": snippet,
+                            "Status": "Not found",
+                            "OpenAlex title": "",
+                            "Year": "",
+                            "Journal (OpenAlex)": "",
+                            "In AJG master?": "",
+                            "AJG 2024": "",
+                            "Warnings": "No match in OpenAlex",
+                            "Link": "",
+                        })
+                        continue
+                    oa_title = work.get("display_name") or ""
+                    oa_year = (work.get("publication_date") or "")[:4] or ""
+                    jname, jissn = get_journal_from_work(work)
+                    master_row = find_journal_in_master(master_df, jname, jissn) if master_df is not None else None
+                    in_ajg = "Yes" if master_row is not None else "No"
+                    ajg24 = (master_row["AJG 2024"] if master_row is not None and "AJG 2024" in master_row else "") or ""
+                    warnings = []
+                    if not doi and work:
+                        warnings.append("Matched by search; verify it is the right work.")
+                    if master_row is None and jname:
+                        warnings.append("Journal not in AJG 2024 master.")
+                    if is_bib and year_bib and oa_year and year_bib != oa_year:
+                        warnings.append(f"Year mismatch: BibTeX={year_bib}, OpenAlex={oa_year}")
+                    if is_bib and journal_bib and jname and normalize_title_for_match(journal_bib) != normalize_title_for_match(jname):
+                        warnings.append("Journal name differs from OpenAlex.")
+                    link = work.get("id") or (f"https://doi.org/{(work.get('ids') or {}).get('doi', '')}" or "")
+                    results.append({
+                        "Reference (snippet)": snippet,
+                        "Status": "Found",
+                        "OpenAlex title": oa_title[:70] + ("…" if len(oa_title) > 70 else ""),
+                        "Year": oa_year,
+                        "Journal (OpenAlex)": (jname or "")[:50] + ("…" if len(jname or "") > 50 else ""),
+                        "In AJG master?": in_ajg,
+                        "AJG 2024": str(ajg24),
+                        "Warnings": "; ".join(warnings) if warnings else "—",
+                        "Link": link,
+                    })
+            st.dataframe(
+                pd.DataFrame(results),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Link": st.column_config.LinkColumn("Link", display_text="Open"),
+                },
+            )
+            found = sum(1 for r in results if r["Status"] == "Found")
+            st.caption(f"**{found}** of {len(results)} references found in OpenAlex. Use OpenAlex as ground truth; treat “Not found” or “Journal not in AJG master” as prompts to verify.")
+
+    st.divider()
+    st.caption("Data: AJG 2024 master + JCR • Literature: [OpenAlex](https://openalex.org) (no API key required)")
+
+    st.sidebar.divider()
+    st.sidebar.caption("Data: ajg_2024_master_with_jcr.csv • Literature: OpenAlex")
+
+
+if __name__ == "__main__":
+    main()

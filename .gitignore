@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Optional: uncomment to avoid committing large data (e.g. PDFs or one-off exports).
+# If you uncomment *.csv below, the required data files are still tracked via the ! rules.
+# *.csv
+# CABS_AJG_2024.pdf
+
+# Required for app and pipeline — keep these tracked so repo runs out of the box
+!ajg_2024_master_with_jcr.csv
+!ajg_2024_ground_truth.csv
+!JCR_ABS.csv
+!BarryQuinn_JCR_JournalResults_11_2024*.csv
+!3and4and4stars.csv

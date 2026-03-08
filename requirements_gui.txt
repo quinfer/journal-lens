@@ -1,0 +1,4 @@
+# For the Journal Lookup GUI (Streamlit) — minimal app-only deps
+# Prefer: pip install -r requirements.txt (includes pipeline deps)
+streamlit>=1.28.0
+pandas>=1.5.0

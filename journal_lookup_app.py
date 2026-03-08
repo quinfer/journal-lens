@@ -9,10 +9,12 @@ Journal Lookup GUI + Literature Search
 Run: streamlit run journal_lookup_app.py
 """
 
+import io
 import re
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from zipfile import ZipFile
 
 import pandas as pd
 import streamlit as st
@@ -100,6 +102,45 @@ def openalex_works_for_issn(
         return []
 
 
+def get_oa_pdf_url(work: dict) -> str | None:
+    """Return a URL for the open-access version (PDF or landing page), or None."""
+    oa = work.get("open_access") or {}
+    url = oa.get("oa_url")
+    if url and isinstance(url, str) and url.startswith("http"):
+        return url
+    loc = work.get("best_oa_location") or work.get("primary_location") or {}
+    url = loc.get("pdf_url") or loc.get("landing_page_url")
+    if url and isinstance(url, str) and url.startswith("http"):
+        return url
+    for loc in work.get("locations") or []:
+        if loc.get("is_oa"):
+            url = loc.get("pdf_url") or loc.get("landing_page_url")
+            if url and isinstance(url, str) and url.startswith("http"):
+                return url
+    return None
+
+
+def fetch_url_as_bytes(url: str, timeout: int = 15, max_size: int = 25 * 1024 * 1024) -> tuple[bytes | None, str]:
+    """Fetch URL; return (body or None, extension 'pdf' or 'html')."""
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "JournalLookupApp/1.0 (https://github.com/quinfer/journal-lens)"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            ct = (resp.headers.get("Content-Type") or "").lower()
+            data = resp.read(max_size + 1)
+            if len(data) > max_size:
+                return None, "html"
+            ext = "pdf" if "pdf" in ct else "html"
+            return bytes(data), ext
+    except Exception:
+        return None, "html"
+
+
+def safe_filename(title: str, max_len: int = 80) -> str:
+    """Make a safe filename from a title."""
+    s = re.sub(r"[^\w\s\-\.]", "", title)[:max_len].strip() or "paper"
+    return re.sub(r"\s+", "_", s)
+
+
 def works_to_display(works: list[dict], include_journal: bool = False) -> list[dict]:
     """Convert OpenAlex work objects to simple rows for display."""
     rows = []
@@ -122,6 +163,7 @@ def works_to_display(works: list[dict], include_journal: bool = False) -> list[d
         elif isinstance(url, str) and not url.startswith("http"):
             url = f"https://doi.org/{url}" if url else ""
         cited = w.get("cited_by_count") or 0
+        pdf_url = get_oa_pdf_url(w)
         row = {
             "Title": title,
             "Year": year,
@@ -129,6 +171,7 @@ def works_to_display(works: list[dict], include_journal: bool = False) -> list[d
             "Cited by": cited,
             "DOI": doi,
             "Open access": "Yes" if is_oa else "No",
+            "PDF": pdf_url or "",
             "URL": url,
         }
         if include_journal:
@@ -404,15 +447,85 @@ def main():
                 st.warning("No works returned. Try different journals or a later from-year.")
             else:
                 rows = works_to_display(all_works, include_journal=len(lit_journals) > 1)
+                st.session_state["literature_works"] = all_works
+                st.session_state["literature_rows"] = rows
+                st.session_state.pop("literature_zip_bytes", None)
                 st.dataframe(
                     pd.DataFrame(rows),
                     use_container_width=True,
                     hide_index=True,
                     column_config={
                         "URL": st.column_config.LinkColumn("URL", display_text="Link"),
+                        "PDF": st.column_config.LinkColumn("PDF", display_text="PDF"),
                     },
                 )
                 st.success(f"Found {len(rows)} works.")
+
+        # ---- Download papers (bulk or selected) ----
+        if st.session_state.get("literature_works"):
+            works = st.session_state["literature_works"]
+            works_with_pdf = [(w, get_oa_pdf_url(w)) for w in works if get_oa_pdf_url(w)]
+            if works_with_pdf:
+                st.markdown("**Download open-access papers**")
+                export_df = pd.DataFrame([
+                    {
+                        "Title": (w.get("display_name") or "")[:200],
+                        "Year": (w.get("publication_date") or "")[:4],
+                        "DOI": (w.get("ids") or {}).get("doi", "").replace("https://doi.org/", ""),
+                        "PDF_URL": get_oa_pdf_url(w),
+                    }
+                    for w in works
+                    if get_oa_pdf_url(w)
+                ])
+                st.download_button(
+                    "Export all OA/PDF links (CSV)",
+                    data=export_df.to_csv(index=False),
+                    mime="text/csv",
+                    file_name="journal_lens_oa_links.csv",
+                    help="CSV of titles and PDF/landing-page URLs for use in a download manager or browser.",
+                )
+                st.caption("Or select papers below to download as a ZIP (max 15).")
+                max_download = min(15, len(works_with_pdf))
+                options = list(range(len(works_with_pdf)))
+                labels = [
+                    f"{works_with_pdf[i][0].get('display_name', '')[:55]} ({(works_with_pdf[i][0].get('publication_date') or '')[:4]})"
+                    for i in options
+                ]
+                selected_idx = st.multiselect(
+                    "Select papers to include in ZIP",
+                    options=options,
+                    format_func=lambda i: labels[i],
+                    default=options[:min(3, len(options))],
+                    max_selections=max_download,
+                )
+                if st.button("Create ZIP of selected papers"):
+                    if not selected_idx:
+                        st.warning("Select at least one paper.")
+                    else:
+                        with st.spinner("Fetching papers..."):
+                            buf = io.BytesIO()
+                            with ZipFile(buf, "w") as zf:
+                                for i in selected_idx:
+                                    w, pdf_url = works_with_pdf[i]
+                                    title = w.get("display_name") or "paper"
+                                    year = (w.get("publication_date") or "")[:4]
+                                    body, ext = fetch_url_as_bytes(pdf_url)
+                                    if body:
+                                        name = f"{safe_filename(title)}_{year}.{ext}"
+                                        zf.writestr(name, body)
+                            buf.seek(0)
+                            st.session_state["literature_zip_bytes"] = buf.getvalue()
+                if st.session_state.get("literature_zip_bytes"):
+                    st.download_button(
+                        "Download ZIP",
+                        data=st.session_state["literature_zip_bytes"],
+                        mime="application/zip",
+                        file_name="journal_lens_papers.zip",
+                        key="dl_zip",
+                    )
+                    st.caption("ZIP contains the selected papers (PDF or HTML). Generate again to change selection.")
+            else:
+                st.caption("No open-access PDF/landing URLs in this result set. Try “Open access only” in the search filters.")
 
     # ---- Sanity check references (GenAI) ----
     st.divider()

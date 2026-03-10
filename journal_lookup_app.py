@@ -120,11 +120,18 @@ def get_oa_pdf_url(work: dict) -> str | None:
     return None
 
 
-def fetch_url_as_bytes(url: str, timeout: int = 15, max_size: int = 25 * 1024 * 1024) -> tuple[bytes | None, str]:
-    """Fetch URL; return (body or None, extension 'pdf' or 'html')."""
+def fetch_url_as_bytes(url: str, timeout: int = 20, max_size: int = 25 * 1024 * 1024) -> tuple[bytes | None, str]:
+    """Fetch URL; return (body or None, extension 'pdf' or 'html'). Follows redirects."""
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "JournalLookupApp/1.0 (https://github.com/quinfer/journal-lens)"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/pdf,text/html,application/xhtml+xml,*/*;q=0.8",
+            },
+        )
+        opener = urllib.request.build_opener(urllib.request.HTTPRedirectHandler())
+        with opener.open(req, timeout=timeout) as resp:
             ct = (resp.headers.get("Content-Type") or "").lower()
             data = resp.read(max_size + 1)
             if len(data) > max_size:
@@ -239,14 +246,26 @@ def openalex_work_by_search(query: str, per_page: int = 3) -> list[dict]:
         return []
 
 
+def _first_str(val) -> str:
+    """Normalize ISSN field: OpenAlex may return a string or a list of strings."""
+    if val is None:
+        return ""
+    if isinstance(val, list):
+        for item in val:
+            if isinstance(item, str) and item.strip():
+                return item.strip()
+        return ""
+    return str(val).strip() if val else ""
+
+
 def get_journal_from_work(w: dict) -> tuple[str, str]:
     """From OpenAlex work get (journal display name, ISSN)."""
     loc = w.get("primary_location") or {}
     src = loc.get("source") or {}
     name = src.get("display_name") or ""
-    issn = (src.get("issn") or "").strip()
-    if not issn and isinstance(src.get("issn_l"), str):
-        issn = src.get("issn_l", "")
+    issn = _first_str(src.get("issn"))
+    if not issn:
+        issn = _first_str(src.get("issn_l"))
     return name, issn
 
 
@@ -450,6 +469,8 @@ def main():
                 st.session_state["literature_works"] = all_works
                 st.session_state["literature_rows"] = rows
                 st.session_state.pop("literature_zip_bytes", None)
+                st.session_state.pop("literature_zip_fetched", None)
+                st.session_state.pop("literature_zip_total", None)
                 st.dataframe(
                     pd.DataFrame(rows),
                     use_container_width=True,
@@ -504,6 +525,7 @@ def main():
                     else:
                         with st.spinner("Fetching papers..."):
                             buf = io.BytesIO()
+                            fetched_count = 0
                             with ZipFile(buf, "w") as zf:
                                 for i in selected_idx:
                                     w, pdf_url = works_with_pdf[i]
@@ -513,9 +535,19 @@ def main():
                                     if body:
                                         name = f"{safe_filename(title)}_{year}.{ext}"
                                         zf.writestr(name, body)
+                                        fetched_count += 1
+                                    else:
+                                        # Always add something: a link file so the ZIP isn't empty
+                                        link_content = f"{title}\n\nYear: {year}\n\nOpen in browser:\n{pdf_url}\n"
+                                        name = f"{safe_filename(title)}_{year}_link.txt"
+                                        zf.writestr(name, link_content.encode("utf-8"))
                             buf.seek(0)
                             st.session_state["literature_zip_bytes"] = buf.getvalue()
+                            st.session_state["literature_zip_fetched"] = fetched_count
+                            st.session_state["literature_zip_total"] = len(selected_idx)
                 if st.session_state.get("literature_zip_bytes"):
+                    total = st.session_state.get("literature_zip_total", 0)
+                    fetched = st.session_state.get("literature_zip_fetched", 0)
                     st.download_button(
                         "Download ZIP",
                         data=st.session_state["literature_zip_bytes"],
@@ -523,7 +555,10 @@ def main():
                         file_name="journal_lens_papers.zip",
                         key="dl_zip",
                     )
-                    st.caption("ZIP contains the selected papers (PDF or HTML). Generate again to change selection.")
+                    if fetched < total:
+                        st.info(f"ZIP has {fetched} fetched file(s) (PDF/HTML) and {total - fetched} link-only file(s). Open the .txt files in the ZIP to get the URL and download in your browser if needed.")
+                    else:
+                        st.caption("ZIP contains the selected papers (PDF or HTML). Generate again to change selection.")
             else:
                 st.caption("No open-access PDF/landing URLs in this result set. Try “Open access only” in the search filters.")
 

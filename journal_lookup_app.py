@@ -278,35 +278,118 @@ def normalize_title_for_match(s: str) -> str:
 
 
 def parse_bibtex_string(bib_content: str) -> list[dict]:
-    """Parse .bib content into list of dicts with keys doi, title, journal, year, snippet. No external deps."""
+    """Parse .bib content into list of dicts with keys doi, title, journal, year, snippet, entry_type, raw_block. No external deps."""
     entries = []
-    # Split by @entry type; keep blocks that look like @article{ ... }, @inbook{ ... }, etc.
-    blocks = re.split(r"@\w+\s*\{", bib_content, flags=re.IGNORECASE)
-    for block in blocks[1:]:  # first split is before any @
-        # First comma up to next } is often the cite key; then fields
+    # Find each @type{ and capture type and block until next @
+    for m in re.finditer(r"@(\w+)\s*\{", bib_content, re.IGNORECASE):
+        entry_type = m.group(1)
+        start = m.end()
+        next_m = re.search(r"@\w+\s*\{", bib_content[start:], re.IGNORECASE)
+        end = start + next_m.start() if next_m else len(bib_content)
+        block = bib_content[start:end]
         field_part = block
         # Extract key = value or key = {value} or key = "value"
         def get_field(name: str) -> str:
-            # Match name = { ... } (non-greedy, allow nested braces roughly) or name = "..."
-            pat = re.compile(
-                rf"{re.escape(name)}\s*=\s*[\{{]\s*([^{{}}]+)[\}}]|{re.escape(name)}\s*=\s*[\"]([^\"]+)[\"]",
+            # Quoted value: name = "value"
+            quoted = re.search(
+                rf"{re.escape(name)}\s*=\s*[\"]([^\"]+)[\"]",
+                field_part,
                 re.IGNORECASE | re.DOTALL,
             )
-            m = pat.search(field_part)
-            if m:
-                return (m.group(1) or m.group(2) or "").strip().replace("\n", " ")
+            if quoted:
+                return quoted.group(1).strip().replace("\n", " ")
+            # Braced value: name = { ... } (allow nested braces like {C}ox)
+            braced = re.search(rf"{re.escape(name)}\s*=\s*[\{{]\s*", field_part, re.IGNORECASE)
+            if braced:
+                start_b = braced.end()
+                depth = 1
+                i = start_b
+                while i < len(field_part) and depth > 0:
+                    if field_part[i] == "{":
+                        depth += 1
+                    elif field_part[i] == "}":
+                        depth -= 1
+                    i += 1
+                if depth == 0:
+                    return field_part[start_b : i - 1].strip().replace("\n", " ")
+            # Fallback: non-nested { ... } only
+            simple = re.compile(
+                rf"{re.escape(name)}\s*=\s*[\{{]\s*([^{{}}]+)[\}}]",
+                re.IGNORECASE | re.DOTALL,
+            )
+            m_s = simple.search(field_part)
+            if m_s:
+                return (m_s.group(1) or "").strip().replace("\n", " ")
             return ""
         doi = get_field("doi") or get_field("DOI")
         if not doi and "doi.org" in field_part:
-            m = re.search(r"doi\.org/(10\.\d{4,}/[^\s\}\"]+)", field_part)
-            if m:
-                doi = m.group(1).rstrip(".,;:)")
+            m_doi = re.search(r"doi\.org/(10\.\d{4,}/[^\s\}\"]+)", field_part)
+            if m_doi:
+                doi = m_doi.group(1).rstrip(".,;:)")
         title = get_field("title") or get_field("Title")
         journal = get_field("journal") or get_field("Journal") or get_field("journaltitle")
         year = get_field("year") or get_field("Year")
         snippet = (title or journal or doi or field_part[:60]).strip()[:80]
-        entries.append({"doi": doi or None, "title": title, "journal": journal, "year": year, "snippet": snippet})
+        entries.append({
+            "doi": doi or None,
+            "title": title,
+            "journal": journal,
+            "year": year,
+            "snippet": snippet,
+            "entry_type": entry_type,
+            "raw_block": block,
+        })
     return entries
+
+
+def _replace_bibtex_field(block: str, field: str, new_value: str) -> str:
+    """Replace first occurrence of field = { ... } or field = \"...\" in block with field = { new_value }."""
+    if not new_value:
+        return block
+    # Braced: field = { ... } (brace-counted)
+    braced = re.search(rf"({re.escape(field)}\s*=\s*[\{{])\s*", block, re.IGNORECASE)
+    if braced:
+        start = braced.end()
+        depth = 1
+        i = start
+        while i < len(block) and depth > 0:
+            if block[i] == "{":
+                depth += 1
+            elif block[i] == "}":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            return block[:start] + new_value + block[i - 1:]
+    # Quoted: field = " ... "
+    quoted = re.search(rf"({re.escape(field)}\s*=\s*[\"])([^\"]*)([\"])", block, re.IGNORECASE)
+    if quoted:
+        return block[: quoted.end(1)] + new_value + block[quoted.start(3) :]
+    return block
+
+
+def build_corrected_bibtex(results: list[dict], refs_raw: list) -> str:
+    """Build a .bib string containing only Found entries with year/journal/title from OpenAlex where we have them."""
+    lines = []
+    for i, r in enumerate(results):
+        if r.get("Status") != "Found":
+            continue
+        ref = refs_raw[i] if i < len(refs_raw) else None
+        if not isinstance(ref, dict) or "raw_block" not in ref:
+            continue
+        block = ref["raw_block"]
+        entry_type = ref.get("entry_type", "article")
+        oa_year = (r.get("Year") or "").strip()
+        oa_journal = (r.get("_oa_journal_full") or r.get("Journal (OpenAlex)") or "").strip()
+        oa_title = (r.get("_oa_title_full") or "").strip()
+        if oa_year:
+            block = _replace_bibtex_field(block, "year", oa_year)
+        if oa_journal:
+            block = _replace_bibtex_field(block, "journal", oa_journal)
+            block = _replace_bibtex_field(block, "journaltitle", oa_journal)
+        if oa_title:
+            block = _replace_bibtex_field(block, "title", oa_title)
+        lines.append(f"@{entry_type}{{{block}\n")
+    return "\n".join(lines) if lines else ""
 
 
 def find_journal_in_master(master_df: pd.DataFrame, journal_name: str, issn: str) -> pd.Series | None:
@@ -585,12 +668,24 @@ def main():
             else:
                 refs_raw = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()]
         else:
-            refs_raw = [ln.strip() for ln in (refs_text or "").strip().splitlines() if ln.strip()]
+            pasted = (refs_text or "").strip()
+            # If pasted text looks like BibTeX (e.g. @article{...), parse as BibTeX so we get one row per entry, not per line
+            if pasted and re.search(r"@\w+\s*\{", pasted, re.IGNORECASE):
+                parsed = parse_bibtex_string(pasted)
+                refs_raw = parsed if parsed else [ln.strip() for ln in pasted.splitlines() if ln.strip()]
+            else:
+                refs_raw = [ln.strip() for ln in pasted.splitlines() if ln.strip()]
         if not refs_raw:
             st.warning("Paste at least one reference line or upload a .txt / .bib file.")
         else:
             master_df = load_master()
+            total_refs = len(refs_raw)
             results = []
+
+            progress_bar = st.progress(0.0, text="Starting validation…")
+            status_placeholder = st.empty()
+            counts_placeholder = st.empty()
+
             for i, ref in enumerate(refs_raw):
                 is_bib = isinstance(ref, dict)
                 if is_bib:
@@ -604,53 +699,68 @@ def main():
                     doi = extract_doi(line)
                     title = journal_bib = year_bib = ""
                     snippet = line[:80] + ("…" if len(line) > 80 else "")
-                with st.spinner(f"Checking reference {i + 1}/{len(refs_raw)}..."):
-                    work = openalex_work_by_doi(doi) if doi else None
-                    if work is None and (title or snippet):
-                        search_snippet = (title or (snippet if is_bib else re.sub(DOI_PATTERN, "", str(ref)).strip()))[:120]
-                        if len(search_snippet) >= 4:
-                            works = openalex_work_by_search(search_snippet, per_page=1)
-                            work = works[0] if works else None
-                    if work is None:
-                        results.append({
-                            "Reference (snippet)": snippet,
-                            "Status": "Not found",
-                            "OpenAlex title": "",
-                            "Year": "",
-                            "Journal (OpenAlex)": "",
-                            "In AJG master?": "",
-                            "AJG 2024": "",
-                            "Warnings": "No match in OpenAlex",
-                            "Link": "",
-                        })
-                        continue
-                    oa_title = work.get("display_name") or ""
-                    oa_year = (work.get("publication_date") or "")[:4] or ""
-                    jname, jissn = get_journal_from_work(work)
-                    master_row = find_journal_in_master(master_df, jname, jissn) if master_df is not None else None
-                    in_ajg = "Yes" if master_row is not None else "No"
-                    ajg24 = (master_row["AJG 2024"] if master_row is not None and "AJG 2024" in master_row else "") or ""
-                    warnings = []
-                    if not doi and work:
-                        warnings.append("Matched by search; verify it is the right work.")
-                    if master_row is None and jname:
-                        warnings.append("Journal not in AJG 2024 master.")
-                    if is_bib and year_bib and oa_year and year_bib != oa_year:
-                        warnings.append(f"Year mismatch: BibTeX={year_bib}, OpenAlex={oa_year}")
-                    if is_bib and journal_bib and jname and normalize_title_for_match(journal_bib) != normalize_title_for_match(jname):
-                        warnings.append("Journal name differs from OpenAlex.")
-                    link = work.get("id") or (f"https://doi.org/{(work.get('ids') or {}).get('doi', '')}" or "")
+
+                pct = (i + 1) / total_refs
+                progress_bar.progress(min(pct, 1.0), text=f"Reference {i + 1} of {total_refs} ({100 * pct:.0f}%)")
+                status_placeholder.caption(f"**Checking:** {snippet or '(no title)'}")
+                found_so_far = sum(1 for r in results if r["Status"] == "Found")
+                not_found_so_far = len(results) - found_so_far
+                counts_placeholder.caption(f"✓ Found: **{found_so_far}** · ✗ Not found: **{not_found_so_far}**")
+
+                work = openalex_work_by_doi(doi) if doi else None
+                if work is None and (title or snippet):
+                    search_snippet = (title or (snippet if is_bib else re.sub(DOI_PATTERN, "", str(ref)).strip()))[:120]
+                    search_snippet = " ".join(search_snippet.split())  # normalize whitespace
+                    if len(search_snippet) >= 4:
+                        works = openalex_work_by_search(search_snippet, per_page=1)
+                        work = works[0] if works else None
+                if work is None:
                     results.append({
                         "Reference (snippet)": snippet,
-                        "Status": "Found",
-                        "OpenAlex title": oa_title[:70] + ("…" if len(oa_title) > 70 else ""),
-                        "Year": oa_year,
-                        "Journal (OpenAlex)": (jname or "")[:50] + ("…" if len(jname or "") > 50 else ""),
-                        "In AJG master?": in_ajg,
-                        "AJG 2024": str(ajg24),
-                        "Warnings": "; ".join(warnings) if warnings else "—",
-                        "Link": link,
+                        "Status": "Not found",
+                        "OpenAlex title": "",
+                        "Year": "",
+                        "Journal (OpenAlex)": "",
+                        "In AJG master?": "",
+                        "AJG 2024": "",
+                        "Warnings": "No match in OpenAlex",
+                        "Link": "",
                     })
+                    continue
+                oa_title = work.get("display_name") or ""
+                oa_year = (work.get("publication_date") or "")[:4] or ""
+                jname, jissn = get_journal_from_work(work)
+                master_row = find_journal_in_master(master_df, jname, jissn) if master_df is not None else None
+                in_ajg = "Yes" if master_row is not None else "No"
+                ajg24 = (master_row["AJG 2024"] if master_row is not None and "AJG 2024" in master_row else "") or ""
+                warnings = []
+                if not doi and work:
+                    warnings.append("Matched by search; verify it is the right work.")
+                if master_row is None and jname:
+                    warnings.append("Journal not in AJG 2024 master.")
+                if is_bib and year_bib and oa_year and year_bib != oa_year:
+                    warnings.append(f"Year mismatch: BibTeX={year_bib}, OpenAlex={oa_year}")
+                if is_bib and journal_bib and jname and normalize_title_for_match(journal_bib) != normalize_title_for_match(jname):
+                    warnings.append("Journal name differs from OpenAlex.")
+                link = work.get("id") or (f"https://doi.org/{(work.get('ids') or {}).get('doi', '')}" or "")
+                results.append({
+                    "Reference (snippet)": snippet,
+                    "Status": "Found",
+                    "OpenAlex title": oa_title[:70] + ("…" if len(oa_title) > 70 else ""),
+                    "_oa_title_full": oa_title,  # for corrected .bib export
+                    "Year": oa_year,
+                    "Journal (OpenAlex)": (jname or "")[:50] + ("…" if len(jname or "") > 50 else ""),
+                    "_oa_journal_full": jname or "",  # for corrected .bib export
+                    "In AJG master?": in_ajg,
+                    "AJG 2024": str(ajg24),
+                    "Warnings": "; ".join(warnings) if warnings else "—",
+                    "Link": link,
+                })
+
+            progress_bar.progress(1.0, text=f"Done — validated {total_refs} reference(s)")
+            status_placeholder.empty()
+            counts_placeholder.empty()
+
             st.dataframe(
                 pd.DataFrame(results),
                 use_container_width=True,
@@ -661,6 +771,20 @@ def main():
             )
             found = sum(1 for r in results if r["Status"] == "Found")
             st.caption(f"**{found}** of {len(results)} references found in OpenAlex. Use OpenAlex as ground truth; treat “Not found” or “Journal not in AJG master” as prompts to verify.")
+
+            has_bib = any(isinstance(r, dict) and r.get("raw_block") for r in refs_raw)
+            if has_bib and found > 0:
+                corrected_bib = build_corrected_bibtex(results, refs_raw)
+                if corrected_bib:
+                    st.download_button(
+                        "Download corrected .bib (Found only, year/journal/title from OpenAlex)",
+                        data=corrected_bib,
+                        mime="application/x-bibtex",
+                        file_name="references_corrected.bib",
+                        key="dl_corrected_bib",
+                    )
+                    st.caption("Contains only references that were found. Year, journal, and title are updated from OpenAlex where they differed.")
+
 
     st.divider()
     st.caption("Data: AJG 2024 master + JCR • Literature: [OpenAlex](https://openalex.org) (no API key required)")

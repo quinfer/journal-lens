@@ -1,15 +1,16 @@
 """
-Journal Lookup GUI + Literature Search
+Provenance — student-facing journal directory, literature search, and reference checking.
 
-- Browse and filter the AJG 2024 master by Field, grade, JCR quartile, etc.
-- Search by journal name.
-- Literature search: find recent works in selected/filtered journals via OpenAlex (no API key).
-- Sanity check: validate references (e.g. from GenAI) against OpenAlex + AJG master.
+- Browse/filter the AJG 2024 master (with JCR quartiles).
+- Find recent papers in listed journals (OpenAlex).
+- Verify references (.bib or pasted text) against OpenAlex and the AJG list.
 
 Run: streamlit run journal_lookup_app.py
 """
 
+import html
 import io
+import os
 import re
 import urllib.parse
 import urllib.request
@@ -24,6 +25,12 @@ import streamlit as st
 # -----------------------------------------------------------------------------
 DATA_DIR = Path(__file__).resolve().parent
 MASTER_CSV = DATA_DIR / "ajg_2024_master_with_jcr.csv"
+OPENALEX_API_KEY = os.environ.get("OPENALEX_API_KEY", "").strip() or None  # optional; avoids rate limits
+# Canonical site URL for OpenAlex User-Agent (override locally if needed, e.g. http://localhost:8501)
+APP_PUBLIC_URL = os.environ.get("APP_PUBLIC_URL", "https://provenance.quinference.com").strip().rstrip("/")
+OPENALEX_USER_AGENT = (
+    f"JournalLookupApp/1.0 (+{APP_PUBLIC_URL}; https://github.com/quinfer/journal-lens)"
+)
 
 # -----------------------------------------------------------------------------
 # Load data
@@ -57,7 +64,7 @@ def format_issn(issn: str) -> str:
 # -----------------------------------------------------------------------------
 def openalex_works_for_issn(
     issn: str,
-    per_page: int = 25,
+    per_page: int = 100,
     from_year: int | None = None,
     to_year: int | None = None,
     search_query: str | None = None,
@@ -87,9 +94,9 @@ def openalex_works_for_issn(
     }
     if search_query and search_query.strip():
         params["search"] = search_query.strip()
-    url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
+    url = _openalex_url("works", params)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "JournalLookupApp/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": OPENALEX_USER_AGENT})
         with urllib.request.urlopen(req, timeout=15) as resp:
             data = resp.read().decode()
     except Exception:
@@ -204,15 +211,77 @@ def extract_doi(line: str) -> str | None:
     return None
 
 
+def _normalize_doi_key(doi: str) -> str:
+    """Canonical form for matching (no URL prefix, lower)."""
+    if not doi:
+        return ""
+    d = doi.strip().rstrip(".,;:)").lower()
+    d = re.sub(r"^https?://(dx\.)?doi\.org/", "", d)
+    return d
+
+
+def openalex_works_by_dois_batch(dois: list[str]) -> dict[str, dict]:
+    """
+    Fetch multiple works in one list+filter call per chunk (up to 100 DOIs each).
+    OpenAlex docs: batch DOI filter with | separator; use per_page=100 to minimize calls.
+    Returns map: normalized_doi -> work dict.
+    """
+    import json
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for d in dois:
+        k = _normalize_doi_key(d)
+        if k and k not in seen:
+            seen.add(k)
+            unique.append(k)
+    out: dict[str, dict] = {}
+    batch_size = 100
+    for start in range(0, len(unique), batch_size):
+        chunk = unique[start : start + batch_size]
+        # Filter: doi:10.1/a|10.2/b (see OpenAlex batching docs)
+        filter_val = "doi:" + "|".join(chunk)
+        params = {"filter": filter_val, "per-page": 100}
+        url = _openalex_url("works", params)
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": OPENALEX_USER_AGENT},
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = resp.read().decode()
+        except Exception:
+            continue
+        try:
+            parsed = json.loads(data)
+            for w in parsed.get("results") or []:
+                ids = w.get("ids") or {}
+                raw = (ids.get("doi") or "").replace("https://doi.org/", "").strip().lower()
+                if raw:
+                    out[_normalize_doi_key(raw)] = w
+        except Exception:
+            continue
+    return out
+
+
+def _openalex_url(path: str, params: dict) -> str:
+    """Build OpenAlex API URL; optional mailto (polite pool) and api_key (if set) to reduce rate limits."""
+    url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
+    url += "&mailto=" + urllib.parse.quote("journal-lens@users.noreply.github.com", safe="")
+    if OPENALEX_API_KEY:
+        url += "&api_key=" + urllib.parse.quote(OPENALEX_API_KEY, safe="")
+    return url
+
+
 def openalex_work_by_doi(doi: str) -> dict | None:
     """Fetch a single work from OpenAlex by DOI. Returns work dict or None."""
     doi = doi.strip().rstrip(".,;:)")
     if not doi.startswith("http"):
         doi = f"https://doi.org/{doi}"
     params = {"filter": f"doi:{doi}", "per-page": 1}
-    url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
+    url = _openalex_url("works", params)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "JournalLookupApp/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": OPENALEX_USER_AGENT})
         with urllib.request.urlopen(req, timeout=10) as resp:
             data = resp.read().decode()
     except Exception:
@@ -231,9 +300,9 @@ def openalex_work_by_search(query: str, per_page: int = 3) -> list[dict]:
     if not query or len(query.strip()) < 3:
         return []
     params = {"search": query.strip()[:200], "per-page": per_page, "sort": "relevance_score:desc"}
-    url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
+    url = _openalex_url("works", params)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "JournalLookupApp/1.0"})
+        req = urllib.request.Request(url, headers={"User-Agent": OPENALEX_USER_AGENT})
         with urllib.request.urlopen(req, timeout=12) as resp:
             data = resp.read().decode()
     except Exception:
@@ -413,29 +482,148 @@ def find_journal_in_master(master_df: pd.DataFrame, journal_name: str, issn: str
 
 
 # -----------------------------------------------------------------------------
-# UI
+# UI — Provenance layout (hero + roman section headers)
 # -----------------------------------------------------------------------------
+def section_header(roman: str, label: str, title: str, caption: str) -> None:
+    """Typographically consistent section header (EB Garamond / DM Mono; see hero CSS)."""
+    st.markdown(
+        f"""
+        <div class="prov-root" style="padding: 1.25rem 0 0.5rem; border: none;">
+          <p class="prov-section-label">{html.escape(roman)}. {html.escape(label)}</p>
+          <h2 class="prov-section-title">{html.escape(title)}</h2>
+          <p class="prov-section-caption">{html.escape(caption)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main():
     st.set_page_config(
-        page_title="Journal Lookup & Literature",
-        page_icon="📚",
+        page_title="Provenance — journals & references",
+        page_icon="📜",
         layout="wide",
         initial_sidebar_state="expanded",
     )
-    # Light polish: reduce top padding, subtle divider
     st.markdown(
         """
         <style>
+        @import url('https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;1,400&family=DM+Mono:wght@400;500&display=swap');
+
+        .prov-root { font-family: 'EB Garamond', Georgia, serif; }
+
+        .prov-eyebrow {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.72rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: #888;
+            margin-bottom: 0.5rem;
+        }
+        .prov-title {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 2.6rem;
+            font-weight: 400;
+            letter-spacing: -0.01em;
+            line-height: 1.15;
+            margin-bottom: 0.2rem;
+        }
+        .prov-ipa {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.8rem;
+            color: #aaa;
+            margin-bottom: 1.2rem;
+        }
+        .prov-rule {
+            border: none;
+            border-top: 1px solid #e0e0e0;
+            margin-bottom: 1.2rem;
+        }
+        .prov-def {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 1.15rem;
+            font-style: italic;
+            color: #555;
+            line-height: 1.6;
+            margin-bottom: 1rem;
+        }
+        .prov-statement {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 1rem;
+            line-height: 1.8;
+            margin-bottom: 1rem;
+        }
+        .prov-coda {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 0.95rem;
+            color: #555;
+            line-height: 1.8;
+            border-left: 2px solid #ccc;
+            padding-left: 1rem;
+            margin-bottom: 0;
+        }
+
+        .prov-section-label {
+            font-family: 'DM Mono', monospace;
+            font-size: 0.68rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: #aaa;
+            margin-bottom: 0.2rem;
+        }
+        .prov-section-title {
+            font-family: 'EB Garamond', Georgia, serif;
+            font-size: 1.5rem;
+            font-weight: 400;
+            margin-bottom: 0.25rem;
+        }
+        .prov-section-caption {
+            font-size: 0.88rem;
+            color: #666;
+            line-height: 1.6;
+            margin-bottom: 0;
+        }
+
         .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
         footer { visibility: hidden; }
         </style>
         """,
         unsafe_allow_html=True,
     )
-    st.title("Journal Lookup & Literature")
-    st.caption(
-        "Browse AJG 2024 by field and grade • Search recent literature via OpenAlex • Validate references (e.g. from GenAI) against OpenAlex and the AJG master."
+    st.markdown(
+        """
+        <div class="prov-root">
+          <p class="prov-eyebrow">quinference.com / provenance</p>
+          <h1 class="prov-title">Provenance</h1>
+          <p class="prov-ipa">/ˈprɒv.ə.nəns/</p>
+          <hr class="prov-rule">
+          <p class="prov-def">The origin and custodial history of a source.</p>
+          <p class="prov-statement">
+            In archival scholarship, provenance determines whether a record can be trusted.
+            In the age of generative AI, the same question applies to every citation:
+            not merely <em>does this paper exist</em>, but <em>does it exist where and as claimed?</em>
+          </p>
+          <p class="prov-coda">
+            This tool applies that standard systematically — tracing each reference back to its
+            source in OpenAlex and the AJG 2024 master, so that the scholarly record remains
+            what it has always been required to be: verifiable.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
+    with st.expander("How to use this tool (quick guide)", expanded=False):
+        st.markdown(
+            """
+1. **Journal directory (I)** — Use the sidebar filters to explore the AJG 2024 list and JCR quartiles.
+2. **Find papers (II)** — Select journals with a valid ISSN; search OpenAlex for recent articles.
+3. **Check references (III)** — Upload a `.bib` or paste references; we match each entry to OpenAlex and flag problems.
+
+**AI-generated bibliographies:** Always verify important citations yourself — this is a sense-check, not a substitute for reading sources or supervisor guidance.
+
+**Privacy:** Uploads are processed in this session to query OpenAlex; we do not store your file for model training.
+            """.strip()
+        )
 
     df = load_master()
     if df is None:
@@ -443,7 +631,7 @@ def main():
         return
 
     # ---- Sidebar filters ----
-    st.sidebar.header("Filters")
+    st.sidebar.header("Journal list filters")
     field_vals = sorted(df["Field"].dropna().astype(str).unique().tolist())
     field_filter = st.sidebar.multiselect("Field (AJG)", field_vals, default=[])
     ajg24_vals = sorted(df["AJG 2024"].dropna().astype(str).unique().tolist(), key=lambda x: (x.replace("*", ""), x))
@@ -471,10 +659,15 @@ def main():
             subset["Journal Title"].astype(str).str.lower().str.contains(title_search.lower(), na=False)
         ]
 
-    st.sidebar.metric("Journals matching filters", len(subset))
+    st.sidebar.metric("Journals matching your filters", len(subset))
 
-    # ---- Main: data table ----
-    st.header("Journals")
+    # ---- I. Journal directory ----
+    section_header(
+        "I",
+        "Journal index",
+        "Journal directory",
+        "Filter the AJG 2024 list by field, grade, and JCR quartile. Search by journal name in the sidebar.",
+    )
     display_cols = [
         "Field", "Journal Title", "AJG 2024", "AJG 2021",
         "JCR_2021_JIF_Quartile", "JCR_2023_JIF_Quartile",
@@ -487,12 +680,17 @@ def main():
         hide_index=True,
     )
     if len(subset) > 500:
-        st.caption(f"Showing first 500 of {len(subset)}. Narrow filters to see fewer.")
+        st.caption(f"Showing first 500 of {len(subset)}. Narrow filters in the sidebar to see fewer.")
 
-    # ---- Literature search tab ----
+    # ---- II. Literature search ----
     st.divider()
-    st.subheader("Literature search (OpenAlex)")
-    st.caption("Fetch articles for selected journals (by ISSN). Optional: text search, open access only, date range, sort by newest or most cited. See docs/OPENALEX_SEARCH.md for full filter reference.")
+    section_header(
+        "II",
+        "Literature",
+        "Find papers in these journals",
+        "Pick journals from your filtered list (each needs a valid ISSN). Optional: keywords, year range, "
+        "open access only, sort by newest or most cited. Results from OpenAlex (openalex.org).",
+    )
 
     # Journals with ISSN for literature search (ISSN can be 8 digits or 7 digits + X)
     def valid_issn(s):
@@ -509,7 +707,7 @@ def main():
         st.info("No journals with ISSN in the current selection. Remove some filters or pick a different set.")
     else:
         lit_journals = st.multiselect(
-            "Journals to search (select one or more)",
+            "Which journals to search? (up to 5)",
             options=with_issn["Journal Title"].astype(str).tolist(),
             default=with_issn["Journal Title"].astype(str).iloc[:1].tolist() if len(with_issn) else [],
             max_selections=5,
@@ -525,7 +723,7 @@ def main():
             index=0,
         )
         per_journal = st.slider("Max works per journal", 5, 50, 15)
-        if st.button("Search literature"):
+        if st.button("Search for papers"):
             all_works = []
             issn_to_title = with_issn.set_index("Journal Title")["ISSN"].to_dict()
             for title in lit_journals:
@@ -570,7 +768,7 @@ def main():
             works = st.session_state["literature_works"]
             works_with_pdf = [(w, get_oa_pdf_url(w)) for w in works if get_oa_pdf_url(w)]
             if works_with_pdf:
-                st.markdown("**Download open-access papers**")
+                st.markdown("**Open-access downloads**")
                 export_df = pd.DataFrame([
                     {
                         "Title": (w.get("display_name") or "")[:200],
@@ -645,17 +843,26 @@ def main():
             else:
                 st.caption("No open-access PDF/landing URLs in this result set. Try “Open access only” in the search filters.")
 
-    # ---- Sanity check references (GenAI) ----
+    # ---- III. Reference checker ----
     st.divider()
-    st.subheader("Sanity check references (GenAI)")
-    st.caption("Paste references or upload a file. Each entry is validated against OpenAlex (ground truth); we report Found / Not found, journal in AJG master, and any mismatches (e.g. BibTeX vs OpenAlex).")
-    refs_file = st.file_uploader("Upload .txt or .bib (optional)", type=["txt", "bib"], help="TXT: one reference per line. BIB: BibTeX entries; DOIs and titles are used for lookup.")
-    refs_text = st.text_area(
-        "Or paste references here (one per line). Ignored if a file is uploaded.",
-        height=100,
-        placeholder="e.g.\nSmith, J. (2023). Title. Journal of Finance. https://doi.org/10.1234/xyz\nOr one DOI per line: 10.1234/xyz",
+    section_header(
+        "III",
+        "Validation",
+        "Check your references",
+        "Upload a .bib file or paste references (one per line, or full BibTeX). Each item is matched to OpenAlex; "
+        "we report found/not found, matched title/year/journal, AJG list status, and warnings for mismatches.",
     )
-    if st.button("Validate against OpenAlex"):
+    refs_file = st.file_uploader(
+        "Upload a file (optional)",
+        type=["txt", "bib"],
+        help="`.bib` = one BibTeX entry per @article/@book block (recommended). `.txt` = one reference or DOI per line.",
+    )
+    refs_text = st.text_area(
+        "Or paste references here (ignored if you uploaded a file above)",
+        height=100,
+        placeholder="One per line, e.g.:\nSmith, J. (2023). Title. Journal of Finance. https://doi.org/10.1234/xyz\n\nOr paste an entire .bib file — we detect BibTeX automatically.",
+    )
+    if st.button("Run reference check"):
         refs_raw: list[str | dict] = []
         if refs_file is not None:
             try:
@@ -686,6 +893,18 @@ def main():
             status_placeholder = st.empty()
             counts_placeholder = st.empty()
 
+            # Prefetch all DOIs in batches (up to 100 per OpenAlex call) — cheaper than N singleton/search calls
+            all_dois: list[str] = []
+            for ref in refs_raw:
+                if isinstance(ref, dict):
+                    d = (ref.get("doi") or "").strip()
+                else:
+                    d = extract_doi(str(ref)) or ""
+                if d:
+                    all_dois.append(d)
+            progress_bar.progress(0.02, text="Batch lookup by DOI…")
+            doi_work_map = openalex_works_by_dois_batch(all_dois) if all_dois else {}
+
             for i, ref in enumerate(refs_raw):
                 is_bib = isinstance(ref, dict)
                 if is_bib:
@@ -701,13 +920,15 @@ def main():
                     snippet = line[:80] + ("…" if len(line) > 80 else "")
 
                 pct = (i + 1) / total_refs
-                progress_bar.progress(min(pct, 1.0), text=f"Reference {i + 1} of {total_refs} ({100 * pct:.0f}%)")
+                progress_bar.progress(min(0.02 + 0.98 * pct, 1.0), text=f"Reference {i + 1} of {total_refs} ({100 * pct:.0f}%)")
                 status_placeholder.caption(f"**Checking:** {snippet or '(no title)'}")
                 found_so_far = sum(1 for r in results if r["Status"] == "Found")
                 not_found_so_far = len(results) - found_so_far
                 counts_placeholder.caption(f"✓ Found: **{found_so_far}** · ✗ Not found: **{not_found_so_far}**")
 
-                work = openalex_work_by_doi(doi) if doi else None
+                work = doi_work_map.get(_normalize_doi_key(doi)) if doi else None
+                if doi and work is None:
+                    work = openalex_work_by_doi(doi)
                 if work is None and (title or snippet):
                     search_snippet = (title or (snippet if is_bib else re.sub(DOI_PATTERN, "", str(ref)).strip()))[:120]
                     search_snippet = " ".join(search_snippet.split())  # normalize whitespace
@@ -757,10 +978,14 @@ def main():
                     "Link": link,
                 })
 
-            progress_bar.progress(1.0, text=f"Done — validated {total_refs} reference(s)")
+            progress_bar.progress(1.0, text=f"Done — checked {total_refs} reference(s)")
             status_placeholder.empty()
             counts_placeholder.empty()
 
+            st.caption(
+                "**How to read the table:** *Reference (snippet)* is from your file. *OpenAlex* columns show what the index matched. "
+                "*In AJG master?* is Yes only if that journal is on the AJG 2024 list loaded here. *Warnings* flag mismatches or things to verify."
+            )
             st.dataframe(
                 pd.DataFrame(results),
                 use_container_width=True,
@@ -770,27 +995,40 @@ def main():
                 },
             )
             found = sum(1 for r in results if r["Status"] == "Found")
-            st.caption(f"**{found}** of {len(results)} references found in OpenAlex. Use OpenAlex as ground truth; treat “Not found” or “Journal not in AJG master” as prompts to verify.")
+            st.caption(
+                f"**{found}** of {len(results)} references matched in OpenAlex. "
+                "Treat **Not found** as a red flag to check manually. "
+                "**Journal not in AJG master** means the matched journal is not on the AJG 2024 list in this app—not necessarily that it is a poor source."
+            )
 
+            if found == 0 and len(results) >= 5:
+                st.warning(
+                    "No references were matched. If you expected matches, the OpenAlex API may be unreachable or rate-limiting from this environment. "
+                    "Try again later, run the app locally, or set the **OPENALEX_API_KEY** environment variable (free key at [openalex.org/settings/api](https://openalex.org/settings/api))."
+                )
             has_bib = any(isinstance(r, dict) and r.get("raw_block") for r in refs_raw)
             if has_bib and found > 0:
                 corrected_bib = build_corrected_bibtex(results, refs_raw)
                 if corrected_bib:
                     st.download_button(
-                        "Download corrected .bib (Found only, year/journal/title from OpenAlex)",
+                        "Download cleaned .bib (matched references only)",
                         data=corrected_bib,
                         mime="application/x-bibtex",
                         file_name="references_corrected.bib",
                         key="dl_corrected_bib",
                     )
-                    st.caption("Contains only references that were found. Year, journal, and title are updated from OpenAlex where they differed.")
+                    st.caption(
+                        "Only references that matched OpenAlex are included. Year, journal, and title are updated from OpenAlex where they differed from your file."
+                    )
 
 
     st.divider()
-    st.caption("Data: AJG 2024 master + JCR • Literature: [OpenAlex](https://openalex.org) (no API key required)")
+    st.caption(
+        "Journal data: ABS **AJG 2024** list with JCR fields • Paper search & reference matching: [OpenAlex](https://openalex.org)"
+    )
 
     st.sidebar.divider()
-    st.sidebar.caption("Data: ajg_2024_master_with_jcr.csv • Literature: OpenAlex")
+    st.sidebar.caption("Provenance • AJG 2024 + JCR master list • OpenAlex for papers & reference lookup")
 
 
 if __name__ == "__main__":

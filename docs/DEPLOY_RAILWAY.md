@@ -29,6 +29,14 @@ Deploy the Streamlit app so it runs on Railway and is reachable via a public URL
 
 5. **Optional – root URL:** If you want the app at the root path (e.g. `https://your-app.up.railway.app/`), no extra config is needed; Streamlit serves the app at `/`.
 
+6. **Optional – custom domain (e.g. `provenance.quinference.com`):**
+   - **DNS (Netlify DNS or your host):** Add a **CNAME** record:
+     - **Name:** `provenance` (or your chosen subdomain)
+     - **Value:** your Railway hostname, e.g. `journal-lens-production.up.railway.app` (exact value from Railway).
+   - **Railway:** Service → **Settings** → **Networking** → **Custom Domain** → add `provenance.quinference.com` (full hostname). Railway will issue TLS once DNS points at the service.
+   - **Propagation:** Often a few minutes; wait until Railway shows the domain as active and HTTPS works.
+   - **OpenAlex User-Agent:** The app sends a `User-Agent` that includes your public URL (default `https://provenance.quinference.com`). To override (e.g. staging), set env var **`APP_PUBLIC_URL`** to that site’s base URL (no trailing slash).
+
 ---
 
 ## If the app fails to start

@@ -1,6 +1,6 @@
-# Journal Lookup app — Install & run
+# Provenance (journal lookup app) — Install & run
 
-Streamlit app for browsing the AJG 2024 master, searching literature via OpenAlex, and validating references.
+Streamlit app **Provenance** for browsing the AJG 2024 master, finding papers in those journals (OpenAlex), and checking references (.bib or pasted text) against OpenAlex and the AJG list. See the in-app expander *Why “Provenance”?* for the student-facing explanation.
 
 ## Install
 
@@ -21,10 +21,10 @@ The app opens at http://localhost:8501. It reads **`ajg_2024_master_with_jcr.csv
 
 ## Features
 
-- **Filters:** Field (AJG), AJG 2024/2021, JCR 2021/2023 quartile, free-text search on journal name.
-- **Table:** Filtered journals with grades, JIF, quartiles, ISSN, Publisher.
-- **Literature search:** Select journals; fetch works from OpenAlex (no API key). Optional: text search, open access only, date range, sort by newest or most cited.
-- **Reference sanity check:** Paste or upload .txt / .bib; validate against OpenAlex; report Found / Not found, journal in AJG master, and mismatches (e.g. BibTeX vs OpenAlex year/journal).
+- **Journal list filters:** Field (AJG), AJG 2024/2021, JCR quartiles, free-text search on journal name.
+- **Journal directory:** Filtered table with grades, JIF, quartiles, ISSN, publisher.
+- **Find papers in these journals:** Select journals (ISSN required); fetch works from OpenAlex. Optional keywords, open access, year range, sort.
+- **Check your references:** Paste or upload `.txt` / `.bib`; match against OpenAlex; optional download of a cleaned `.bib` for matched items.
 
 ## macOS: run as an app
 

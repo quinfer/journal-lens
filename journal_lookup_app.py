@@ -69,6 +69,7 @@ def openalex_works_for_issn(
     to_year: int | None = None,
     search_query: str | None = None,
     open_access_only: bool = False,
+    has_abstract_only: bool = False,
     sort_by: str = "publication_date:desc",
 ) -> list[dict]:
     """Fetch works from OpenAlex for a journal by ISSN, with optional search and filters."""
@@ -86,6 +87,8 @@ def openalex_works_for_issn(
         filters.append(f"to_publication_date:{to_year}-12-31")
     if open_access_only:
         filters.append("is_oa:true")
+    if has_abstract_only:
+        filters.append("has_abstract:true")
 
     params = {
         "filter": ",".join(filters),
@@ -153,6 +156,26 @@ def safe_filename(title: str, max_len: int = 80) -> str:
     """Make a safe filename from a title."""
     s = re.sub(r"[^\w\s\-\.]", "", title)[:max_len].strip() or "paper"
     return re.sub(r"\s+", "_", s)
+
+
+def abstract_from_inverted_index(inv: dict | None, max_chars: int = 4000) -> str:
+    """Reconstruct a plaintext abstract from OpenAlex `abstract_inverted_index`."""
+    if not inv or not isinstance(inv, dict):
+        return ""
+    pos_to_word: dict[int, str] = {}
+    for word, positions in inv.items():
+        if not isinstance(word, str) or not isinstance(positions, list):
+            continue
+        for p in positions:
+            if isinstance(p, int):
+                pos_to_word[p] = word
+    if not pos_to_word:
+        return ""
+    text = " ".join(pos_to_word[p] for p in sorted(pos_to_word))
+    if max_chars and len(text) > max_chars:
+        cut = text[:max_chars].rsplit(" ", 1)[0].strip()
+        return (cut or text[:max_chars].strip()) + "…"
+    return text
 
 
 def works_to_display(works: list[dict], include_journal: bool = False) -> list[dict]:
@@ -315,27 +338,48 @@ def openalex_work_by_search(query: str, per_page: int = 3) -> list[dict]:
         return []
 
 
-def _first_str(val) -> str:
-    """Normalize ISSN field: OpenAlex may return a string or a list of strings."""
-    if val is None:
-        return ""
-    if isinstance(val, list):
-        for item in val:
-            if isinstance(item, str) and item.strip():
-                return item.strip()
-        return ""
-    return str(val).strip() if val else ""
+def _collect_issns_from_source(src: dict) -> list[str]:
+    """All distinct ISSN strings from OpenAlex source (print + electronic order varies; master may list only one)."""
+    raw: list[str] = []
+    for key in ("issn", "issn_l"):
+        val = src.get(key)
+        if isinstance(val, list):
+            raw.extend(str(x).strip() for x in val if x and str(x).strip())
+        elif val and str(val).strip():
+            raw.append(str(val).strip())
+    seen: set[str] = set()
+    out: list[str] = []
+    for r in raw:
+        k = re.sub(r"\D", "", r)
+        if len(k) >= 7 and k not in seen:
+            seen.add(k)
+            out.append(r)
+    return out
 
 
-def get_journal_from_work(w: dict) -> tuple[str, str]:
-    """From OpenAlex work get (journal display name, ISSN)."""
+def get_journal_from_work(w: dict) -> tuple[str, list[str]]:
+    """From OpenAlex work get (journal display name, list of ISSNs)."""
     loc = w.get("primary_location") or {}
     src = loc.get("source") or {}
     name = src.get("display_name") or ""
-    issn = _first_str(src.get("issn"))
-    if not issn:
-        issn = _first_str(src.get("issn_l"))
-    return name, issn
+    return name, _collect_issns_from_source(src)
+
+
+def _substring_at_token_boundaries(needle: str, haystack: str) -> bool:
+    """True if needle appears in haystack as a contiguous token run (not e.g. 'management science' inside '… management sciences')."""
+    if not needle or not haystack or len(needle) > len(haystack):
+        return False
+    start = 0
+    while True:
+        i = haystack.find(needle, start)
+        if i < 0:
+            return False
+        before_ok = i == 0 or haystack[i - 1] == " "
+        j = i + len(needle)
+        after_ok = j == len(haystack) or haystack[j] == " "
+        if before_ok and after_ok:
+            return True
+        start = i + 1
 
 
 def normalize_title_for_match(s: str) -> str:
@@ -461,22 +505,38 @@ def build_corrected_bibtex(results: list[dict], refs_raw: list) -> str:
     return "\n".join(lines) if lines else ""
 
 
-def find_journal_in_master(master_df: pd.DataFrame, journal_name: str, issn: str) -> pd.Series | None:
-    """Return first master row matching journal by name or ISSN, else None."""
+def find_journal_in_master(
+    master_df: pd.DataFrame, journal_name: str, issn: str | list[str] | None
+) -> pd.Series | None:
+    """Match journal by ISSN (any variant), exact normalized title, then token-boundary substring."""
     if not journal_name and not issn:
         return None
-    issn_clean = re.sub(r"\D", "", str(issn)) if issn else ""
-    if issn_clean and len(issn_clean) >= 7:
-        master_issn = master_df["ISSN"].astype(str).str.replace(r"\D", "", regex=True)
-        match = master_df[master_issn == issn_clean]
-        if not match.empty:
-            return match.iloc[0]
+    issn_list: list[str] = []
+    if issn:
+        if isinstance(issn, list):
+            issn_list = [x for x in issn if x and str(x).strip()]
+        else:
+            issn_list = [str(issn).strip()] if str(issn).strip() else []
+    master_issn = master_df["ISSN"].astype(str).str.replace(r"\D", "", regex=True)
+    for raw in issn_list:
+        issn_clean = re.sub(r"\D", "", str(raw))
+        if issn_clean and len(issn_clean) >= 7:
+            match = master_df[master_issn == issn_clean]
+            if not match.empty:
+                return match.iloc[0]
     name_norm = normalize_title_for_match(journal_name)
     if not name_norm:
         return None
     for _, row in master_df.iterrows():
+        t = row.get("Journal Title") or ""
+        if normalize_title_for_match(t) == name_norm:
+            return row
+    for _, row in master_df.iterrows():
         t = (row.get("Journal Title") or "")
-        if name_norm in normalize_title_for_match(t) or normalize_title_for_match(t) in name_norm:
+        t_norm = normalize_title_for_match(t)
+        if not t_norm:
+            continue
+        if _substring_at_token_boundaries(name_norm, t_norm) or _substring_at_token_boundaries(t_norm, name_norm):
             return row
     return None
 
@@ -716,6 +776,11 @@ def main():
         to_year = st.number_input("To publication year (optional)", min_value=1990, max_value=2030, value=2030, step=1, help="Leave at 2030 for 'up to now'")
         search_query = st.text_input("Search in title/abstract (optional)", placeholder="e.g. corporate governance")
         open_access_only = st.checkbox("Open access only", value=False)
+        has_abstract_only = st.checkbox(
+            "Has abstract only",
+            value=False,
+            help="Only return works where OpenAlex provides an abstract (stored as an inverted index; we can reconstruct it for CSV export).",
+        )
         sort_by = st.selectbox(
             "Sort by",
             options=["publication_date:desc", "cited_by_count:desc"],
@@ -738,6 +803,7 @@ def main():
                         to_year=to_year if to_year != 2030 else None,
                         search_query=search_query.strip() or None,
                         open_access_only=open_access_only,
+                        has_abstract_only=has_abstract_only,
                         sort_by=sort_by,
                     )
                 for w in works:
@@ -766,6 +832,73 @@ def main():
         # ---- Download papers (bulk or selected) ----
         if st.session_state.get("literature_works"):
             works = st.session_state["literature_works"]
+
+            st.markdown("**Export results**")
+            include_abstracts = st.checkbox(
+                "Include abstracts in CSV export (larger file)",
+                value=False,
+                key="lit_export_include_abstracts",
+                help="OpenAlex provides abstracts as `abstract_inverted_index`; we reconstruct plaintext for the CSV.",
+            )
+            abstract_max_chars = 4000
+            if include_abstracts:
+                abstract_max_chars = st.slider(
+                    "Max abstract characters per work",
+                    min_value=500,
+                    max_value=8000,
+                    value=4000,
+                    step=500,
+                    key="lit_export_abstract_max_chars",
+                )
+
+            export_rows: list[dict] = []
+            for w in works:
+                authors = w.get("authorships") or []
+                author_names = ", ".join(
+                    [
+                        ((a.get("author") or {}).get("display_name") or "").strip()
+                        for a in authors[:5]
+                        if ((a.get("author") or {}).get("display_name") or "").strip()
+                    ]
+                )
+                if len(authors) > 5:
+                    author_names = (author_names + " et al.").strip()
+                ids = w.get("ids") or {}
+                doi = (ids.get("doi") or "").replace("https://doi.org/", "")
+                oa = w.get("open_access") or {}
+                row = {
+                    "Journal": w.get("_journal", ""),
+                    "Title": (w.get("display_name") or w.get("title") or "").strip(),
+                    "Publication date": (w.get("publication_date") or "").strip(),
+                    "Year": str(w.get("publication_year") or "") or ((w.get("publication_date") or "")[:4] or ""),
+                    "Type": (w.get("type") or "").strip(),
+                    "Authors": author_names,
+                    "Cited by": w.get("cited_by_count") or 0,
+                    "DOI": doi,
+                    "OpenAlex": w.get("id") or "",
+                    "Open access": "Yes" if oa.get("is_oa", False) else "No",
+                    "OA status": oa.get("oa_status") or "",
+                    "OA URL": oa.get("oa_url") or "",
+                    "PDF/landing": get_oa_pdf_url(w) or "",
+                }
+                if include_abstracts:
+                    row["Abstract"] = abstract_from_inverted_index(
+                        w.get("abstract_inverted_index"), max_chars=abstract_max_chars
+                    )
+                export_rows.append(row)
+
+            export_df = pd.DataFrame(export_rows)
+            st.download_button(
+                "Export literature results (CSV)",
+                data=export_df.to_csv(index=False),
+                mime="text/csv",
+                file_name="journal_lens_literature_results.csv",
+            )
+            if include_abstracts:
+                st.caption(
+                    "Abstracts are reconstructed from OpenAlex `abstract_inverted_index` and truncated to the max length above."
+                )
+
             works_with_pdf = [(w, get_oa_pdf_url(w)) for w in works if get_oa_pdf_url(w)]
             if works_with_pdf:
                 st.markdown("**Open-access downloads**")
@@ -950,8 +1083,8 @@ def main():
                     continue
                 oa_title = work.get("display_name") or ""
                 oa_year = (work.get("publication_date") or "")[:4] or ""
-                jname, jissn = get_journal_from_work(work)
-                master_row = find_journal_in_master(master_df, jname, jissn) if master_df is not None else None
+                jname, jissns = get_journal_from_work(work)
+                master_row = find_journal_in_master(master_df, jname, jissns) if master_df is not None else None
                 in_ajg = "Yes" if master_row is not None else "No"
                 ajg24 = (master_row["AJG 2024"] if master_row is not None and "AJG 2024" in master_row else "") or ""
                 warnings = []
